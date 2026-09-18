@@ -12,9 +12,22 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "grabber",
         "width": 800,
         "height": 600
+      },
+      {
+        "label": "capture",
+        "title": "grabber capture",
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true,
+        "shadow": false,
+        "width": 1,
+        "height": 1
       }
     ],
     "security": {

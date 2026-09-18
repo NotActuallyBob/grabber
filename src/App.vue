@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
+import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 type Selection = {
   left: number;
@@ -20,16 +22,22 @@ type ScreenCapture = {
 };
 
 const currentWindow = getCurrentWindow();
+const isCaptureWindow = currentWindow.label === "capture";
 const selectionImage = ref("");
 const screenshot = ref("");
+const screenshotZoom = ref(1);
+const screenshotPanX = ref(0);
+const screenshotPanY = ref(0);
+const isPanningScreenshot = ref(false);
+const screenshotPanStart = ref({ x: 0, y: 0 });
+const screenshotPanOrigin = ref({ x: 0, y: 0 });
 const isSelecting = ref(false);
 const isDragging = ref(false);
 const selection = ref<Selection | null>(null);
 const selectionSurface = ref<HTMLElement | null>(null);
 const startPoint = ref({ x: 0, y: 0 });
-const originalPosition = ref<PhysicalPosition | null>(null);
-const originalSize = ref<PhysicalSize | null>(null);
-const originalResizable = ref<boolean | null>(null);
+let unlistenCaptureStart: UnlistenFn | undefined;
+let unlistenCaptureComplete: UnlistenFn | undefined;
 
 const selectionStyle = computed(() => {
   if (!selection.value) {
@@ -48,27 +56,17 @@ function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), maximum);
 }
 
-async function restoreWindow() {
-  await currentWindow.setDecorations(true);
-  await currentWindow.setShadow(true);
-  await currentWindow.setSkipTaskbar(false);
-  await currentWindow.setResizable(originalResizable.value ?? true);
-  if (originalPosition.value && originalSize.value) {
-    await currentWindow.setPosition(originalPosition.value);
-    await currentWindow.setSize(originalSize.value);
-  }
-  await currentWindow.setAlwaysOnTop(false);
-  originalPosition.value = null;
-  originalSize.value = null;
-  originalResizable.value = null;
-}
-
 async function cancelSelection() {
+  if (!isCaptureWindow) {
+    return;
+  }
+
   selectionImage.value = "";
   selection.value = null;
   isDragging.value = false;
   isSelecting.value = false;
-  await restoreWindow();
+  localStorage.removeItem("grabber.pendingCapture");
+  await currentWindow.hide();
 }
 
 function onEscape(event: KeyboardEvent) {
@@ -78,26 +76,41 @@ function onEscape(event: KeyboardEvent) {
 }
 
 async function beginSelection() {
+  if (isCaptureWindow) {
+    return;
+  }
+
   try {
     const capture = await invoke<ScreenCapture>("capture_screen");
-    originalPosition.value = await currentWindow.outerPosition();
-    originalSize.value = await currentWindow.outerSize();
-    originalResizable.value = await currentWindow.isResizable();
-    selectionImage.value = capture.data_url;
-    await currentWindow.setAlwaysOnTop(true);
-    await currentWindow.setSkipTaskbar(true);
-    await currentWindow.setResizable(false);
-    await currentWindow.setDecorations(false);
-    await currentWindow.setShadow(false);
-    await currentWindow.setPosition(new PhysicalPosition(capture.x, capture.y));
-    await currentWindow.setSize(new PhysicalSize(capture.width, capture.height));
-    await nextTick();
-    isSelecting.value = true;
-    window.addEventListener("keydown", onEscape);
+    localStorage.setItem("grabber.pendingCapture", JSON.stringify(capture));
+    let captureWindow = await WebviewWindow.getByLabel("capture");
+    if (!captureWindow) {
+      const createdWindow = new WebviewWindow("capture", {
+        url: "/",
+        visible: false,
+        decorations: false,
+        resizable: false,
+        skipTaskbar: true,
+        alwaysOnTop: true,
+        shadow: false,
+        width: 1,
+        height: 1,
+      });
+      await new Promise<void>((resolve, reject) => {
+        createdWindow.once("tauri://created", () => resolve());
+        createdWindow.once("tauri://error", (event) => reject(event));
+      });
+      captureWindow = createdWindow;
+    }
+
+    await captureWindow.setPosition(new PhysicalPosition(capture.x, capture.y));
+    await captureWindow.setSize(new PhysicalSize(capture.width, capture.height));
+    await captureWindow.show();
+    await captureWindow.setFocus();
+    await emitTo("capture", "capture-start", capture);
   } catch (error) {
     console.error("Unable to start screen capture", error);
-    selectionImage.value = "";
-    await restoreWindow();
+    localStorage.removeItem("grabber.pendingCapture");
   }
 }
 
@@ -187,21 +200,144 @@ async function completeDrag(event: PointerEvent) {
     canvas.width,
     canvas.height,
   );
-  screenshot.value = canvas.toDataURL("image/png");
+  const capturedImage = canvas.toDataURL("image/png");
+  if (isCaptureWindow) {
+    await emitTo("main", "capture-complete", capturedImage);
+    localStorage.setItem("grabber.completedCapture", capturedImage);
+    await currentWindow.hide();
+    return;
+  }
+
+  screenshot.value = capturedImage;
+  screenshotZoom.value = 1;
+  screenshotPanX.value = 0;
+  screenshotPanY.value = 0;
   window.removeEventListener("keydown", onEscape);
   selectionImage.value = "";
   selection.value = null;
   isDragging.value = false;
   isSelecting.value = false;
-  await restoreWindow();
 }
 
-onBeforeUnmount(() => window.removeEventListener("keydown", onEscape));
+function startCapture(capture: ScreenCapture) {
+  selection.value = null;
+  isDragging.value = false;
+  selectionSurface.value = null;
+  startPoint.value = { x: 0, y: 0 };
+  selectionImage.value = capture.data_url;
+  isSelecting.value = true;
+  window.addEventListener("keydown", onEscape);
+}
+
+function loadPendingCapture() {
+  const pending = localStorage.getItem("grabber.pendingCapture");
+  if (!pending || !isCaptureWindow) {
+    return;
+  }
+
+  const capture = JSON.parse(pending) as ScreenCapture;
+  startCapture(capture);
+}
+
+function handleStorage(event: StorageEvent) {
+  if (event.key === "grabber.completedCapture" && event.newValue && !isCaptureWindow) {
+    screenshot.value = event.newValue;
+    screenshotZoom.value = 1;
+    screenshotPanX.value = 0;
+    screenshotPanY.value = 0;
+    localStorage.removeItem("grabber.completedCapture");
+  }
+
+  if (event.key === "grabber.pendingCapture" && event.newValue && isCaptureWindow) {
+    loadPendingCapture();
+  }
+}
+
+onMounted(async () => {
+  window.addEventListener("storage", handleStorage);
+  if (isCaptureWindow) {
+    unlistenCaptureStart = await listen<ScreenCapture>("capture-start", (event) => {
+      startCapture(event.payload);
+    });
+  } else {
+    unlistenCaptureComplete = await listen<string>("capture-complete", (event) => {
+      screenshot.value = event.payload;
+      screenshotZoom.value = 1;
+      screenshotPanX.value = 0;
+      screenshotPanY.value = 0;
+    });
+  }
+  loadPendingCapture();
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onEscape);
+  window.removeEventListener("storage", handleStorage);
+  unlistenCaptureStart?.();
+  unlistenCaptureComplete?.();
+});
+
+function zoomScreenshot(event: WheelEvent) {
+  if (!screenshot.value) {
+    return;
+  }
+
+  event.preventDefault();
+  if (event.ctrlKey) {
+    const step = event.deltaY < 0 ? 0.1 : -0.1;
+    screenshotZoom.value = Math.min(4, Math.max(0.25, screenshotZoom.value + step));
+    return;
+  }
+
+  if (event.shiftKey) {
+    screenshotPanX.value -= event.deltaY;
+    return;
+  }
+
+  screenshotPanY.value -= event.deltaY;
+}
+
+function startScreenshotPan(event: PointerEvent) {
+  if (event.button !== 1 || !event.isPrimary) {
+    return;
+  }
+
+  const viewer = event.currentTarget as HTMLElement;
+  isPanningScreenshot.value = true;
+  screenshotPanStart.value = { x: event.clientX, y: event.clientY };
+  screenshotPanOrigin.value = {
+    x: screenshotPanX.value,
+    y: screenshotPanY.value,
+  };
+  viewer.setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function moveScreenshotPan(event: PointerEvent) {
+  if (!isPanningScreenshot.value) {
+    return;
+  }
+
+  screenshotPanX.value =
+    screenshotPanOrigin.value.x + event.clientX - screenshotPanStart.value.x;
+  screenshotPanY.value =
+    screenshotPanOrigin.value.y + event.clientY - screenshotPanStart.value.y;
+}
+
+function endScreenshotPan(event: PointerEvent) {
+  if (!isPanningScreenshot.value) {
+    return;
+  }
+
+  const viewer = event.currentTarget as HTMLElement;
+  isPanningScreenshot.value = false;
+  viewer.releasePointerCapture(event.pointerId);
+}
 </script>
 
 <template>
   <v-app>
-    <v-app-bar v-if="!isSelecting" flat>
+    <v-app-bar flat height="64">
       <v-spacer />
       <v-btn
         icon="mdi-camera-outline"
@@ -212,8 +348,24 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onEscape));
       />
     </v-app-bar>
 
-    <v-main class="main-content">
-      <v-img v-if="screenshot" :src="screenshot" contain max-height="calc(100vh - 64px)" />
+    <v-main class="main-content" @wheel.prevent.stop="zoomScreenshot">
+      <div
+        v-if="screenshot"
+        class="screenshot-viewer"
+        @pointerdown="startScreenshotPan"
+        @pointermove="moveScreenshotPan"
+        @pointerup="endScreenshotPan"
+        @pointercancel="endScreenshotPan"
+      >
+        <img
+          :src="screenshot"
+          class="screenshot-image"
+          :style="{
+            transform: `translate(${screenshotPanX}px, ${screenshotPanY}px) scale(${screenshotZoom})`,
+          }"
+          alt="Selected screenshot"
+        />
+      </div>
     </v-main>
 
     <div
@@ -240,6 +392,27 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow: hidden !important;
+  overscroll-behavior: none;
+}
+
+.screenshot-viewer {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.screenshot-image {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  transform-origin: center;
 }
 
 .selection-surface {
