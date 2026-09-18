@@ -35,6 +35,7 @@ const isSelecting = ref(false);
 const isDragging = ref(false);
 const selection = ref<Selection | null>(null);
 const selectionSurface = ref<HTMLElement | null>(null);
+const screenshotViewer = ref<HTMLElement | null>(null);
 const startPoint = ref({ x: 0, y: 0 });
 let unlistenCaptureStart: UnlistenFn | undefined;
 let unlistenCaptureComplete: UnlistenFn | undefined;
@@ -284,8 +285,21 @@ function zoomScreenshot(event: WheelEvent) {
 
   event.preventDefault();
   if (event.ctrlKey) {
+    const viewer = screenshotViewer.value;
+    const previousZoom = screenshotZoom.value;
     const step = event.deltaY < 0 ? 0.1 : -0.1;
-    screenshotZoom.value = Math.min(4, Math.max(0.25, screenshotZoom.value + step));
+    const nextZoom = Math.min(4, Math.max(0.25, previousZoom + step));
+    if (viewer && nextZoom !== previousZoom) {
+      const bounds = viewer.getBoundingClientRect();
+      const cursorOffsetX = event.clientX - (bounds.left + bounds.width / 2);
+      const cursorOffsetY = event.clientY - (bounds.top + bounds.height / 2);
+      const zoomAdjustment = 1 - nextZoom / previousZoom;
+      screenshotPanX.value +=
+        zoomAdjustment * (cursorOffsetX - screenshotPanX.value);
+      screenshotPanY.value +=
+        zoomAdjustment * (cursorOffsetY - screenshotPanY.value);
+    }
+    screenshotZoom.value = nextZoom;
     return;
   }
 
@@ -351,6 +365,7 @@ function endScreenshotPan(event: PointerEvent) {
     <v-main class="main-content" @wheel.prevent.stop="zoomScreenshot">
       <div
         v-if="screenshot"
+        ref="screenshotViewer"
         class="screenshot-viewer"
         @pointerdown="startScreenshotPan"
         @pointermove="moveScreenshotPan"
