@@ -54,6 +54,11 @@ type AnnotationText = {
   height: number;
   text: string;
   color: string;
+  fontFamily: string;
+  fontSize: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
   order: number;
 };
 
@@ -73,11 +78,28 @@ const shapeMenuOpen = ref(false);
 const isShapeMode = ref(false);
 const selectedShape = ref<AnnotationRectangle["kind"]>("rectangle");
 const isTextMode = ref(false);
+const selectedFont = ref("Arial");
+const selectedFontSize = ref(16);
+const selectedBold = ref(false);
+const selectedItalic = ref(false);
+const selectedUnderline = ref(false);
 const isEraserMode = ref(false);
 const isErasing = ref(false);
 const annotationTexts = ref<AnnotationText[]>([]);
 const currentTextBox = ref<AnnotationText | null>(null);
 const movingText = ref<{ id: number; startX: number; startY: number; originX: number; originY: number } | null>(null);
+const selectedTextId = ref<number | null>(null);
+const textResizeCorners = ["top-left", "top-right", "bottom-left", "bottom-right"] as const;
+const resizingText = ref<{
+  id: number;
+  corner: "top-left" | "top-right" | "bottom-left" | "bottom-right";
+  startX: number;
+  startY: number;
+  originX: number;
+  originY: number;
+  originWidth: number;
+  originHeight: number;
+} | null>(null);
 const annotationRectangles = ref<AnnotationRectangle[]>([]);
 const currentRectangle = ref<AnnotationRectangle | null>(null);
 const annotationPaths = ref<AnnotationStroke[]>([]);
@@ -129,6 +151,7 @@ function showScreenshot(image: string) {
   annotationRectangles.value = [];
   annotationTexts.value = [];
   currentTextBox.value = null;
+  selectedTextId.value = null;
   annotationOrder.value = 0;
   currentAnnotation.value = [];
   currentRectangle.value = null;
@@ -369,6 +392,7 @@ function handleStorage(event: StorageEvent) {
 onMounted(async () => {
   window.addEventListener("keydown", onKeyboardShortcut);
   window.addEventListener("pointerdown", closeContextMenu);
+  window.addEventListener("pointerdown", clearTextSelection);
   window.addEventListener("storage", handleStorage);
   if (isCaptureWindow) {
     unlistenCaptureStart = await listen<ScreenCapture>("capture-start", (event) => {
@@ -385,6 +409,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener("keydown", onKeyboardShortcut);
   window.removeEventListener("pointerdown", closeContextMenu);
+  window.removeEventListener("pointerdown", clearTextSelection);
   window.removeEventListener("keydown", onEscape);
   window.removeEventListener("storage", handleStorage);
   unlistenCaptureStart?.();
@@ -738,6 +763,33 @@ function closeContextMenu() {
   contextMenu.value.visible = false;
 }
 
+function clearTextSelection(event: PointerEvent) {
+  const target = event.target as HTMLElement;
+  if (!target.closest(".text-box") && !target.closest(".text-toolbar")) {
+    selectedTextId.value = null;
+  }
+}
+
+function applyTextStyle() {
+  const text = annotationTexts.value.find(({ order }) => order === selectedTextId.value);
+  if (text) {
+    text.fontFamily = selectedFont.value;
+    text.fontSize = selectedFontSize.value;
+    text.bold = selectedBold.value;
+    text.italic = selectedItalic.value;
+    text.underline = selectedUnderline.value;
+  }
+}
+
+function selectTextBox(text: AnnotationText) {
+  selectedTextId.value = text.order;
+  selectedFont.value = text.fontFamily;
+  selectedFontSize.value = text.fontSize;
+  selectedBold.value = text.bold;
+  selectedItalic.value = text.italic;
+  selectedUnderline.value = text.underline;
+}
+
 function toggleBrush() {
   if (isDrawingMode.value) {
     brushMenuOpen.value = !brushMenuOpen.value;
@@ -867,6 +919,11 @@ function startText(event: PointerEvent) {
     height: 0,
     text: "",
     color: brushColor.value,
+    fontFamily: selectedFont.value,
+    fontSize: selectedFontSize.value,
+    bold: selectedBold.value,
+    italic: selectedItalic.value,
+    underline: selectedUnderline.value,
     order: annotationOrder.value++,
   };
   (event.currentTarget as SVGElement).setPointerCapture(event.pointerId);
@@ -917,23 +974,70 @@ function startTextMove(event: PointerEvent, text: AnnotationText) {
     originX: text.x,
     originY: text.y,
   };
+  selectTextBox(text);
+  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+}
+
+function startTextResize(
+  event: PointerEvent,
+  text: AnnotationText,
+  corner: "top-left" | "top-right" | "bottom-left" | "bottom-right",
+) {
+  if (event.button !== 0) {
+    return;
+  }
+
+  selectTextBox(text);
+  resizingText.value = {
+    id: text.order,
+    corner,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: text.x,
+    originY: text.y,
+    originWidth: text.width,
+    originHeight: text.height,
+  };
   (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
 }
 
 function moveTextBox(event: PointerEvent) {
-  if (!movingText.value || !screenshotImage.value) {
+  if (!screenshotImage.value) {
     return;
   }
   const bounds = screenshotImage.value.getBoundingClientRect();
-  const text = annotationTexts.value.find(({ order }) => order === movingText.value?.id);
-  if (text) {
-    text.x = movingText.value.originX + (event.clientX - movingText.value.startX) / bounds.width;
-    text.y = movingText.value.originY + (event.clientY - movingText.value.startY) / bounds.height;
+  if (resizingText.value) {
+    const resize = resizingText.value;
+    const text = annotationTexts.value.find(({ order }) => order === resize.id);
+    if (!text) {
+      return;
+    }
+    const deltaX = (event.clientX - resize.startX) / bounds.width;
+    const deltaY = (event.clientY - resize.startY) / bounds.height;
+    const right = resize.originX + resize.originWidth;
+    const bottom = resize.originY + resize.originHeight;
+    const nextLeft = resize.corner.includes("left") ? Math.min(right - 0.02, resize.originX + deltaX) : resize.originX;
+    const nextTop = resize.corner.includes("top") ? Math.min(bottom - 0.02, resize.originY + deltaY) : resize.originY;
+    const nextRight = resize.corner.includes("right") ? Math.max(resize.originX + 0.02, right + deltaX) : right;
+    const nextBottom = resize.corner.includes("bottom") ? Math.max(resize.originY + 0.02, bottom + deltaY) : bottom;
+    text.x = nextLeft;
+    text.y = nextTop;
+    text.width = nextRight - nextLeft;
+    text.height = nextBottom - nextTop;
+    return;
+  }
+
+  const move = movingText.value;
+  const text = annotationTexts.value.find(({ order }) => order === move?.id);
+  if (text && move) {
+    text.x = move.originX + (event.clientX - move.startX) / bounds.width;
+    text.y = move.originY + (event.clientY - move.startY) / bounds.height;
   }
 }
 
 function endTextMove() {
   movingText.value = null;
+  resizingText.value = null;
 }
 
 function handleAnnotationDown(event: PointerEvent) {
@@ -1134,6 +1238,49 @@ function toggleShapesMenu() {
     </v-app-bar>
 
     <v-main class="main-content" @wheel.prevent.stop="zoomScreenshot">
+      <v-card v-if="isTextMode" class="text-toolbar pa-2" elevation="4">
+        <v-select
+          v-model="selectedFont"
+          :items="['Arial', 'Georgia', 'Verdana']"
+          label="Font"
+          density="compact"
+          variant="outlined"
+          hide-details
+          class="text-toolbar-field"
+          @update:model-value="applyTextStyle"
+        />
+        <v-select
+          v-model="selectedFontSize"
+          :items="[8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 26, 30, 34, 40, 60]"
+          label="Size"
+          density="compact"
+          variant="outlined"
+          hide-details
+          class="text-toolbar-field text-size-field"
+          @update:model-value="applyTextStyle"
+        />
+        <v-btn
+          icon="mdi-format-bold"
+          :color="selectedBold ? 'primary' : undefined"
+          variant="text"
+          aria-label="Bold"
+          @click="selectedBold = !selectedBold; applyTextStyle()"
+        />
+        <v-btn
+          icon="mdi-format-italic"
+          :color="selectedItalic ? 'primary' : undefined"
+          variant="text"
+          aria-label="Italic"
+          @click="selectedItalic = !selectedItalic; applyTextStyle()"
+        />
+        <v-btn
+          icon="mdi-format-underline"
+          :color="selectedUnderline ? 'primary' : undefined"
+          variant="text"
+          aria-label="Underline"
+          @click="selectedUnderline = !selectedUnderline; applyTextStyle()"
+        />
+      </v-card>
       <div
         v-if="screenshot"
         ref="screenshotViewer"
@@ -1295,32 +1442,50 @@ function toggleShapesMenu() {
             v-for="text in annotationTexts"
             :key="text.order"
             class="text-box"
+            :class="{ selected: selectedTextId === text.order }"
             :data-order="text.order"
             @pointerdown.stop
+            @pointerdown="startTextMove($event, text)"
+            @pointermove="moveTextBox"
+            @pointerup="endTextMove"
+            @pointercancel="endTextMove"
+            @click.stop="selectTextBox(text)"
             :style="{
               left: `${text.x * 100}%`,
               top: `${text.y * 100}%`,
               width: `${text.width * 100}%`,
               height: `${text.height * 100}%`,
               color: text.color,
+              fontFamily: text.fontFamily,
+              fontSize: `${text.fontSize}px`,
+              fontWeight: text.bold ? '700' : '400',
+              fontStyle: text.italic ? 'italic' : 'normal',
+              textDecoration: text.underline ? 'underline' : 'none',
             }"
           >
-            <button
-              class="text-move-handle"
-              type="button"
-              aria-label="Move text"
-              @pointerdown.stop="startTextMove($event, text)"
-              @pointermove.stop="moveTextBox"
-              @pointerup.stop="endTextMove"
-              @pointercancel.stop="endTextMove"
-            >
-              <v-icon size="12">mdi-drag</v-icon>
-            </button>
             <textarea
               v-model="text.text"
               class="text-input"
-              :style="{ color: text.color }"
+              :style="{
+                color: text.color,
+                fontFamily: text.fontFamily,
+                fontSize: `${text.fontSize}px`,
+                fontWeight: text.bold ? '700' : '400',
+                fontStyle: text.italic ? 'italic' : 'normal',
+                textDecoration: text.underline ? 'underline' : 'none',
+              }"
               @pointerdown.stop
+              @focus="selectTextBox(text)"
+            />
+            <span
+              v-for="corner in textResizeCorners"
+              :key="corner"
+              class="text-resize-handle"
+              :class="corner"
+              @pointerdown.stop="startTextResize($event, text, corner)"
+              @pointermove.stop="moveTextBox"
+              @pointerup.stop="endTextMove"
+              @pointercancel.stop="endTextMove"
             />
           </div>
         </div>
@@ -1359,11 +1524,37 @@ body {
 }
 
 .main-content {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   overflow: hidden !important;
   overscroll-behavior: none;
+}
+
+.text-toolbar {
+  position: fixed;
+  z-index: 3000;
+  top: 72px;
+  left: 50%;
+  display: flex;
+  width: fit-content;
+  min-width: 300px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-radius: 8px;
+  background: white;
+  transform: translateX(-50%);
+  pointer-events: auto;
+}
+
+.text-toolbar-field {
+  width: 150px;
+}
+
+.text-size-field {
+  width: 100px;
 }
 
 .top-bar {
@@ -1451,8 +1642,13 @@ body {
   position: absolute;
   min-width: 48px;
   min-height: 28px;
-  border: 1px dashed rgba(0, 0, 0, 0.35);
+  border: 1px dashed transparent;
   pointer-events: auto;
+  cursor: move;
+}
+
+.text-box.selected {
+  border-color: rgba(23, 105, 170, 0.8);
 }
 
 .text-input {
@@ -1469,21 +1665,44 @@ body {
   line-height: 1.2;
 }
 
-.text-move-handle {
+.text-resize-handle {
   position: absolute;
-  z-index: 1;
-  top: -18px;
-  left: -1px;
-  display: flex;
-  width: 20px;
-  height: 18px;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 1px solid rgba(0, 0, 0, 0.2);
-  background: white;
-  cursor: move;
+  display: none;
+  width: 8px;
+  height: 8px;
+  border: 1px solid white;
+  border-radius: 50%;
+  background: #1769aa;
 }
+
+.text-box.selected .text-resize-handle {
+  display: block;
+}
+
+.text-resize-handle.top-left {
+  top: -5px;
+  left: -5px;
+  cursor: nwse-resize;
+}
+
+.text-resize-handle.top-right {
+  top: -5px;
+  right: -5px;
+  cursor: nesw-resize;
+}
+
+.text-resize-handle.bottom-left {
+  bottom: -5px;
+  left: -5px;
+  cursor: nesw-resize;
+}
+
+.text-resize-handle.bottom-right {
+  right: -5px;
+  bottom: -5px;
+  cursor: nwse-resize;
+}
+
 
 .selection-surface {
   position: fixed;
