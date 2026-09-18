@@ -27,10 +27,24 @@ type AnnotationPoint = {
 };
 
 type AnnotationStroke = {
+  kind: "stroke";
   points: AnnotationPoint[];
   color: string;
   width: number;
+  order: number;
 };
+
+type AnnotationRectangle = {
+  kind: "rectangle" | "oval" | "line" | "arrow" | "triangle";
+  start: AnnotationPoint;
+  end: AnnotationPoint;
+  color: string;
+  width: number;
+  fill: boolean;
+  order: number;
+};
+
+type AnnotationItem = AnnotationStroke | AnnotationRectangle;
 
 const currentWindow = getCurrentWindow();
 const isCaptureWindow = currentWindow.label === "capture";
@@ -43,8 +57,15 @@ const isDrawingMode = ref(false);
 const brushMenuOpen = ref(false);
 const brushColor = ref("#e53935");
 const brushWidth = ref(4);
+const fillShapes = ref(false);
+const shapeMenuOpen = ref(false);
+const isShapeMode = ref(false);
+const selectedShape = ref<AnnotationRectangle["kind"]>("rectangle");
+const annotationRectangles = ref<AnnotationRectangle[]>([]);
+const currentRectangle = ref<AnnotationRectangle | null>(null);
 const annotationPaths = ref<AnnotationStroke[]>([]);
 const currentAnnotation = ref<AnnotationPoint[]>([]);
+const annotationOrder = ref(0);
 const contextMenu = ref({ visible: false, x: 0, y: 0 });
 const isPanningScreenshot = ref(false);
 const screenshotPanStart = ref({ x: 0, y: 0 });
@@ -58,6 +79,11 @@ const screenshotImage = ref<HTMLImageElement | null>(null);
 const startPoint = ref({ x: 0, y: 0 });
 let unlistenCaptureStart: UnlistenFn | undefined;
 let unlistenCaptureComplete: UnlistenFn | undefined;
+
+const orderedAnnotations = computed<AnnotationItem[]>(() => [
+  ...annotationPaths.value,
+  ...annotationRectangles.value,
+].sort((first, second) => first.order - second.order));
 
 const selectionStyle = computed(() => {
   if (!selection.value) {
@@ -82,8 +108,13 @@ function showScreenshot(image: string) {
   screenshotPanX.value = 0;
   screenshotPanY.value = 0;
   annotationPaths.value = [];
+  annotationRectangles.value = [];
+  annotationOrder.value = 0;
   currentAnnotation.value = [];
+  currentRectangle.value = null;
   isDrawingMode.value = false;
+  isShapeMode.value = false;
+  selectedShape.value = "rectangle";
 }
 
 async function cancelSelection() {
@@ -394,7 +425,11 @@ function annotationPoint(event: PointerEvent) {
 }
 
 function startAnnotation(event: PointerEvent) {
-  if (!isDrawingMode.value || event.button !== 0 || !event.isPrimary) {
+  if (
+    (!isDrawingMode.value && !isShapeMode.value) ||
+    event.button !== 0 ||
+    !event.isPrimary
+  ) {
     return;
   }
 
@@ -403,12 +438,32 @@ function startAnnotation(event: PointerEvent) {
     return;
   }
 
-  currentAnnotation.value = [point];
+  if (isShapeMode.value) {
+    currentRectangle.value = {
+      kind: selectedShape.value,
+      start: point,
+      end: point,
+      color: brushColor.value,
+      width: brushWidth.value,
+      fill: fillShapes.value,
+      order: annotationOrder.value++,
+    };
+  } else {
+    currentAnnotation.value = [point];
+  }
   (event.currentTarget as SVGElement).setPointerCapture(event.pointerId);
   event.preventDefault();
 }
 
 function moveAnnotation(event: PointerEvent) {
+  if (isShapeMode.value && currentRectangle.value) {
+    const point = annotationPoint(event);
+    if (point) {
+      currentRectangle.value = { ...currentRectangle.value, end: point };
+    }
+    return;
+  }
+
   if (!currentAnnotation.value.length) {
     return;
   }
@@ -420,6 +475,16 @@ function moveAnnotation(event: PointerEvent) {
 }
 
 function endAnnotation(event: PointerEvent) {
+  if (isShapeMode.value && currentRectangle.value) {
+    annotationRectangles.value = [
+      ...annotationRectangles.value,
+      currentRectangle.value,
+    ];
+    currentRectangle.value = null;
+    (event.currentTarget as SVGElement).releasePointerCapture(event.pointerId);
+    return;
+  }
+
   if (!currentAnnotation.value.length) {
     return;
   }
@@ -427,9 +492,11 @@ function endAnnotation(event: PointerEvent) {
   annotationPaths.value = [
     ...annotationPaths.value,
     {
+      kind: "stroke",
       points: currentAnnotation.value,
       color: brushColor.value,
       width: brushWidth.value,
+      order: annotationOrder.value++,
     },
   ];
   currentAnnotation.value = [];
@@ -438,6 +505,15 @@ function endAnnotation(event: PointerEvent) {
 
 function annotationPoints(path: AnnotationPoint[]) {
   return path.map((point) => `${point.x * 100},${point.y * 100}`).join(" ");
+}
+
+function rectangleGeometry(rectangle: AnnotationRectangle) {
+  return {
+    x: Math.min(rectangle.start.x, rectangle.end.x) * 100,
+    y: Math.min(rectangle.start.y, rectangle.end.y) * 100,
+    width: Math.abs(rectangle.end.x - rectangle.start.x) * 100,
+    height: Math.abs(rectangle.end.y - rectangle.start.y) * 100,
+  };
 }
 
 function annotationLayerStyle() {
@@ -505,6 +581,84 @@ async function copyAnnotatedScreenshot() {
     context.stroke();
   }
 
+  for (const rectangle of [
+    ...annotationRectangles.value,
+    ...(currentRectangle.value ? [currentRectangle.value] : []),
+  ]) {
+    const geometry = rectangleGeometry(rectangle);
+    context.strokeStyle = rectangle.color;
+    context.lineWidth = Math.max(4, (image.naturalWidth / 300) * (rectangle.width / 4));
+    const startX = (rectangle.start.x / 100) * canvas.width;
+    const startY = (rectangle.start.y / 100) * canvas.height;
+    const endX = (rectangle.end.x / 100) * canvas.width;
+    const endY = (rectangle.end.y / 100) * canvas.height;
+    if (rectangle.kind === "line" || rectangle.kind === "arrow") {
+      context.beginPath();
+      context.moveTo(rectangle.start.x * canvas.width, rectangle.start.y * canvas.height);
+      context.lineTo(rectangle.end.x * canvas.width, rectangle.end.y * canvas.height);
+      context.stroke();
+      if (rectangle.kind === "arrow") {
+        const angle = Math.atan2(endY - startY, endX - startX);
+        const headLength = Math.max(3, context.lineWidth * 1.2);
+        context.beginPath();
+        context.moveTo(endX, endY);
+        context.lineTo(
+          endX - headLength * Math.cos(angle - Math.PI / 6),
+          endY - headLength * Math.sin(angle - Math.PI / 6),
+        );
+        context.moveTo(endX, endY);
+        context.lineTo(
+          endX - headLength * Math.cos(angle + Math.PI / 6),
+          endY - headLength * Math.sin(angle + Math.PI / 6),
+        );
+        context.stroke();
+      }
+    } else if (rectangle.kind === "oval") {
+      context.beginPath();
+      context.ellipse(
+        (startX + endX) / 2,
+        (startY + endY) / 2,
+        Math.abs(endX - startX) / 2,
+        Math.abs(endY - startY) / 2,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      if (rectangle.fill) {
+        context.fillStyle = rectangle.color;
+        context.fill();
+      }
+      context.stroke();
+    } else if (rectangle.kind === "triangle") {
+      context.beginPath();
+      context.moveTo((geometry.x + geometry.width / 2) * canvas.width / 100, geometry.y * canvas.height / 100);
+      context.lineTo((geometry.x + geometry.width) * canvas.width / 100, (geometry.y + geometry.height) * canvas.height / 100);
+      context.lineTo(geometry.x * canvas.width / 100, (geometry.y + geometry.height) * canvas.height / 100);
+      context.closePath();
+      if (rectangle.fill) {
+        context.fillStyle = rectangle.color;
+        context.fill();
+      }
+      context.stroke();
+    } else {
+      if (rectangle.fill) {
+        context.fillStyle = rectangle.color;
+        context.fillRect(
+          (geometry.x / 100) * canvas.width,
+          (geometry.y / 100) * canvas.height,
+          (geometry.width / 100) * canvas.width,
+          (geometry.height / 100) * canvas.height,
+        );
+      }
+      context.strokeRect(
+        (geometry.x / 100) * canvas.width,
+        (geometry.y / 100) * canvas.height,
+        (geometry.width / 100) * canvas.width,
+        (geometry.height / 100) * canvas.height,
+      );
+    }
+  }
+
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
   if (blob && navigator.clipboard && typeof ClipboardItem !== "undefined") {
     await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
@@ -528,8 +682,27 @@ function toggleBrush() {
   if (isDrawingMode.value) {
     brushMenuOpen.value = !brushMenuOpen.value;
   } else {
+    isShapeMode.value = false;
+    shapeMenuOpen.value = false;
     isDrawingMode.value = true;
   }
+}
+
+function selectShape(kind: AnnotationRectangle["kind"]) {
+  isShapeMode.value = true;
+  isDrawingMode.value = false;
+  brushMenuOpen.value = false;
+  currentRectangle.value = currentRectangle.value
+    ? { ...currentRectangle.value, kind }
+    : null;
+  selectedShape.value = kind;
+}
+
+function toggleShapesMenu() {
+  isShapeMode.value = true;
+  isDrawingMode.value = false;
+  brushMenuOpen.value = false;
+  shapeMenuOpen.value = !shapeMenuOpen.value;
 }
 </script>
 
@@ -585,9 +758,73 @@ function toggleBrush() {
               />
             </span>
           </div>
-          <v-btn block variant="text" size="small" @click="isDrawingMode = false; brushMenuOpen = false">
-            Done
-          </v-btn>
+        </v-card>
+      </v-menu>
+      <v-menu
+        v-model="shapeMenuOpen"
+        location="end"
+        :close-on-content-click="false"
+        :open-on-click="false"
+      >
+        <template #activator="{ props }">
+          <v-btn
+            v-bind="props"
+            class="annotation-button"
+            :color="isShapeMode ? 'primary' : undefined"
+            icon="mdi-shape-outline"
+            variant="text"
+            aria-label="Shapes"
+            title="Shapes"
+            :disabled="!screenshot"
+            @click="toggleShapesMenu"
+          />
+        </template>
+        <v-card width="180">
+          <v-list density="compact">
+            <v-list-item
+              prepend-icon="mdi-rectangle-outline"
+              title="Rectangle"
+              :active="selectedShape === 'rectangle'"
+              active-color="primary"
+              @click="selectShape('rectangle')"
+            />
+            <v-list-item
+              prepend-icon="mdi-ellipse-outline"
+              title="Oval"
+              :active="selectedShape === 'oval'"
+              active-color="primary"
+              @click="selectShape('oval')"
+            />
+            <v-list-item
+              prepend-icon="mdi-vector-line"
+              title="Line"
+              :active="selectedShape === 'line'"
+              active-color="primary"
+              @click="selectShape('line')"
+            />
+            <v-list-item
+              prepend-icon="mdi-arrow-top-right"
+              title="Arrow"
+              :active="selectedShape === 'arrow'"
+              active-color="primary"
+              @click="selectShape('arrow')"
+            />
+            <v-list-item
+              prepend-icon="mdi-triangle-outline"
+              title="Triangle"
+              :active="selectedShape === 'triangle'"
+              active-color="primary"
+              @click="selectShape('triangle')"
+            />
+          </v-list>
+          <v-checkbox
+            v-model="fillShapes"
+            label="Fill"
+            density="compact"
+            hide-details
+            class="px-3"
+            :disabled="selectedShape !== 'rectangle' && selectedShape !== 'oval' && selectedShape !== 'triangle'"
+          />
         </v-card>
       </v-menu>
     </v-navigation-drawer>
@@ -625,7 +862,7 @@ function toggleBrush() {
           alt="Selected screenshot"
         />
         <svg
-          v-if="isDrawingMode"
+          v-if="isDrawingMode || isShapeMode"
           class="annotation-layer"
           :style="annotationLayerStyle()"
           viewBox="0 0 100 100"
@@ -635,17 +872,70 @@ function toggleBrush() {
           @pointerup.stop="endAnnotation"
           @pointercancel.stop="endAnnotation"
         >
-          <polyline
-            v-for="(stroke, index) in annotationPaths"
-            :key="index"
-            :points="annotationPoints(stroke.points)"
-            fill="none"
-            :stroke="stroke.color"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            :stroke-width="stroke.width"
-            vector-effect="non-scaling-stroke"
-          />
+          <defs>
+            <marker
+              id="annotation-arrowhead"
+              markerWidth="3"
+              markerHeight="3"
+              refX="2.5"
+              refY="1.5"
+              orient="auto"
+              markerUnits="userSpaceOnUse"
+            >
+              <path d="M 0 0 L 3 1.5 L 0 3 z" fill="context-stroke" />
+            </marker>
+          </defs>
+          <g v-for="(annotation, index) in orderedAnnotations" :key="index">
+            <polyline
+              v-if="annotation.kind === 'stroke'"
+              :points="annotationPoints(annotation.points)"
+              fill="none"
+              :stroke="annotation.color"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              :stroke-width="annotation.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <rect
+              v-else-if="annotation.kind === 'rectangle'"
+              v-bind="rectangleGeometry(annotation)"
+              :fill="annotation.fill ? annotation.color : 'none'"
+              :stroke="annotation.color"
+              :stroke-width="annotation.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <ellipse
+              v-else-if="annotation.kind === 'oval'"
+              :cx="(annotation.start.x + annotation.end.x) * 50"
+              :cy="(annotation.start.y + annotation.end.y) * 50"
+              :rx="Math.abs(annotation.end.x - annotation.start.x) * 50"
+              :ry="Math.abs(annotation.end.y - annotation.start.y) * 50"
+              :fill="annotation.fill ? annotation.color : 'none'"
+              :stroke="annotation.color"
+              :stroke-width="annotation.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <polygon
+              v-else-if="annotation.kind === 'triangle'"
+              :points="`${(annotation.start.x + annotation.end.x) * 50},${Math.min(annotation.start.y, annotation.end.y) * 100} ${Math.max(annotation.start.x, annotation.end.x) * 100},${Math.max(annotation.start.y, annotation.end.y) * 100} ${Math.min(annotation.start.x, annotation.end.x) * 100},${Math.max(annotation.start.y, annotation.end.y) * 100}`"
+              :fill="annotation.fill ? annotation.color : 'none'"
+              :stroke="annotation.color"
+              :stroke-width="annotation.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <line
+              v-else
+              :x1="annotation.start.x * 100"
+              :y1="annotation.start.y * 100"
+              :x2="annotation.end.x * 100"
+              :y2="annotation.end.y * 100"
+              :stroke="annotation.color"
+              :stroke-width="annotation.width"
+              stroke-linecap="round"
+              :marker-end="annotation.kind === 'arrow' ? 'url(#annotation-arrowhead)' : undefined"
+              vector-effect="non-scaling-stroke"
+            />
+          </g>
           <polyline
             v-if="currentAnnotation.length"
             :points="annotationPoints(currentAnnotation)"
@@ -656,6 +946,47 @@ function toggleBrush() {
             :stroke-width="brushWidth"
             vector-effect="non-scaling-stroke"
           />
+          <g v-if="currentRectangle">
+            <rect
+              v-if="currentRectangle.kind === 'rectangle'"
+              v-bind="rectangleGeometry(currentRectangle)"
+              :fill="currentRectangle.fill ? currentRectangle.color : 'none'"
+              :stroke="currentRectangle.color"
+              :stroke-width="currentRectangle.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <ellipse
+              v-else-if="currentRectangle.kind === 'oval'"
+              :cx="(currentRectangle.start.x + currentRectangle.end.x) * 50"
+              :cy="(currentRectangle.start.y + currentRectangle.end.y) * 50"
+              :rx="Math.abs(currentRectangle.end.x - currentRectangle.start.x) * 50"
+              :ry="Math.abs(currentRectangle.end.y - currentRectangle.start.y) * 50"
+              :fill="currentRectangle.fill ? currentRectangle.color : 'none'"
+              :stroke="currentRectangle.color"
+              :stroke-width="currentRectangle.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <polygon
+              v-else-if="currentRectangle.kind === 'triangle'"
+              :points="`${(currentRectangle.start.x + currentRectangle.end.x) * 50},${Math.min(currentRectangle.start.y, currentRectangle.end.y) * 100} ${Math.max(currentRectangle.start.x, currentRectangle.end.x) * 100},${Math.max(currentRectangle.start.y, currentRectangle.end.y) * 100} ${Math.min(currentRectangle.start.x, currentRectangle.end.x) * 100},${Math.max(currentRectangle.start.y, currentRectangle.end.y) * 100}`"
+              :fill="currentRectangle.fill ? currentRectangle.color : 'none'"
+              :stroke="currentRectangle.color"
+              :stroke-width="currentRectangle.width"
+              vector-effect="non-scaling-stroke"
+            />
+            <line
+              v-else
+              :x1="currentRectangle.start.x * 100"
+              :y1="currentRectangle.start.y * 100"
+              :x2="currentRectangle.end.x * 100"
+              :y2="currentRectangle.end.y * 100"
+              :stroke="currentRectangle.color"
+              :stroke-width="currentRectangle.width"
+              stroke-linecap="round"
+              :marker-end="currentRectangle.kind === 'arrow' ? 'url(#annotation-arrowhead)' : undefined"
+              vector-effect="non-scaling-stroke"
+            />
+          </g>
         </svg>
       </div>
     </v-main>
