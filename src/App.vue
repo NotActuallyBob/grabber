@@ -21,6 +21,11 @@ type ScreenCapture = {
   height: number;
 };
 
+type AnnotationPoint = {
+  x: number;
+  y: number;
+};
+
 const currentWindow = getCurrentWindow();
 const isCaptureWindow = currentWindow.label === "capture";
 const selectionImage = ref("");
@@ -28,6 +33,9 @@ const screenshot = ref("");
 const screenshotZoom = ref(1);
 const screenshotPanX = ref(0);
 const screenshotPanY = ref(0);
+const isDrawingMode = ref(false);
+const annotationPaths = ref<AnnotationPoint[][]>([]);
+const currentAnnotation = ref<AnnotationPoint[]>([]);
 const isPanningScreenshot = ref(false);
 const screenshotPanStart = ref({ x: 0, y: 0 });
 const screenshotPanOrigin = ref({ x: 0, y: 0 });
@@ -36,6 +44,7 @@ const isDragging = ref(false);
 const selection = ref<Selection | null>(null);
 const selectionSurface = ref<HTMLElement | null>(null);
 const screenshotViewer = ref<HTMLElement | null>(null);
+const screenshotImage = ref<HTMLImageElement | null>(null);
 const startPoint = ref({ x: 0, y: 0 });
 let unlistenCaptureStart: UnlistenFn | undefined;
 let unlistenCaptureComplete: UnlistenFn | undefined;
@@ -55,6 +64,16 @@ const selectionStyle = computed(() => {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), maximum);
+}
+
+function showScreenshot(image: string) {
+  screenshot.value = image;
+  screenshotZoom.value = 1;
+  screenshotPanX.value = 0;
+  screenshotPanY.value = 0;
+  annotationPaths.value = [];
+  currentAnnotation.value = [];
+  isDrawingMode.value = false;
 }
 
 async function cancelSelection() {
@@ -209,10 +228,7 @@ async function completeDrag(event: PointerEvent) {
     return;
   }
 
-  screenshot.value = capturedImage;
-  screenshotZoom.value = 1;
-  screenshotPanX.value = 0;
-  screenshotPanY.value = 0;
+  showScreenshot(capturedImage);
   window.removeEventListener("keydown", onEscape);
   selectionImage.value = "";
   selection.value = null;
@@ -242,10 +258,7 @@ function loadPendingCapture() {
 
 function handleStorage(event: StorageEvent) {
   if (event.key === "grabber.completedCapture" && event.newValue && !isCaptureWindow) {
-    screenshot.value = event.newValue;
-    screenshotZoom.value = 1;
-    screenshotPanX.value = 0;
-    screenshotPanY.value = 0;
+    showScreenshot(event.newValue);
     localStorage.removeItem("grabber.completedCapture");
   }
 
@@ -262,10 +275,7 @@ onMounted(async () => {
     });
   } else {
     unlistenCaptureComplete = await listen<string>("capture-complete", (event) => {
-      screenshot.value = event.payload;
-      screenshotZoom.value = 1;
-      screenshotPanX.value = 0;
-      screenshotPanY.value = 0;
+      showScreenshot(event.payload);
     });
   }
   loadPendingCapture();
@@ -347,11 +357,104 @@ function endScreenshotPan(event: PointerEvent) {
   isPanningScreenshot.value = false;
   viewer.releasePointerCapture(event.pointerId);
 }
+
+function annotationPoint(event: PointerEvent) {
+  const viewer = screenshotViewer.value;
+  const image = screenshotImage.value;
+  if (!viewer || !image) {
+    return null;
+  }
+
+  const imageBounds = image.getBoundingClientRect();
+  if (
+    event.clientX < imageBounds.left ||
+    event.clientX > imageBounds.right ||
+    event.clientY < imageBounds.top ||
+    event.clientY > imageBounds.bottom
+  ) {
+    return null;
+  }
+
+  return {
+    x: (event.clientX - imageBounds.left) / imageBounds.width,
+    y: (event.clientY - imageBounds.top) / imageBounds.height,
+  };
+}
+
+function startAnnotation(event: PointerEvent) {
+  if (!isDrawingMode.value || event.button !== 0 || !event.isPrimary) {
+    return;
+  }
+
+  const point = annotationPoint(event);
+  if (!point) {
+    return;
+  }
+
+  currentAnnotation.value = [point];
+  (event.currentTarget as SVGElement).setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function moveAnnotation(event: PointerEvent) {
+  if (!currentAnnotation.value.length) {
+    return;
+  }
+
+  const point = annotationPoint(event);
+  if (point) {
+    currentAnnotation.value = [...currentAnnotation.value, point];
+  }
+}
+
+function endAnnotation(event: PointerEvent) {
+  if (!currentAnnotation.value.length) {
+    return;
+  }
+
+  annotationPaths.value = [...annotationPaths.value, currentAnnotation.value];
+  currentAnnotation.value = [];
+  (event.currentTarget as SVGElement).releasePointerCapture(event.pointerId);
+}
+
+function annotationPoints(path: AnnotationPoint[]) {
+  return path.map((point) => `${point.x * 100},${point.y * 100}`).join(" ");
+}
+
+function annotationLayerStyle() {
+  const viewer = screenshotViewer.value;
+  const image = screenshotImage.value;
+  if (!viewer || !image) {
+    return {};
+  }
+
+  const viewerBounds = viewer.getBoundingClientRect();
+  const imageBounds = image.getBoundingClientRect();
+  return {
+    left: `${imageBounds.left - viewerBounds.left}px`,
+    top: `${imageBounds.top - viewerBounds.top}px`,
+    width: `${imageBounds.width}px`,
+    height: `${imageBounds.height}px`,
+  };
+}
 </script>
 
 <template>
   <v-app>
-    <v-app-bar flat height="64">
+    <v-navigation-drawer permanent width="64" class="side-panel">
+      <v-btn
+        class="annotation-button"
+        :color="isDrawingMode ? 'primary' : undefined"
+        icon="mdi-pen"
+        variant="text"
+        aria-label="Annotate screenshot"
+        title="Annotate screenshot"
+        :disabled="!screenshot"
+        @click="isDrawingMode = !isDrawingMode"
+      />
+    </v-navigation-drawer>
+
+    <v-app-bar flat height="64" class="top-bar">
       <v-spacer />
       <v-btn
         icon="mdi-camera-outline"
@@ -360,6 +463,7 @@ function endScreenshotPan(event: PointerEvent) {
         title="Take screenshot"
         @click="beginSelection"
       />
+      <v-spacer />
     </v-app-bar>
 
     <v-main class="main-content" @wheel.prevent.stop="zoomScreenshot">
@@ -373,6 +477,7 @@ function endScreenshotPan(event: PointerEvent) {
         @pointercancel="endScreenshotPan"
       >
         <img
+          ref="screenshotImage"
           :src="screenshot"
           class="screenshot-image"
           :style="{
@@ -380,6 +485,28 @@ function endScreenshotPan(event: PointerEvent) {
           }"
           alt="Selected screenshot"
         />
+        <svg
+          v-if="isDrawingMode"
+          class="annotation-layer"
+          :style="annotationLayerStyle()"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="none"
+          @pointerdown.stop="startAnnotation"
+          @pointermove.stop="moveAnnotation"
+          @pointerup.stop="endAnnotation"
+          @pointercancel.stop="endAnnotation"
+        >
+          <polyline
+            v-for="(path, index) in [...annotationPaths, currentAnnotation]"
+            :key="index"
+            :points="annotationPoints(path)"
+            fill="none"
+            stroke="#e53935"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="0.7"
+          />
+        </svg>
       </div>
     </v-main>
 
@@ -411,7 +538,19 @@ body {
   overscroll-behavior: none;
 }
 
+.top-bar {
+  left: 0 !important;
+  width: 100% !important;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.12);
+}
+
+.side-panel {
+  top: 64px !important;
+  height: calc(100% - 64px) !important;
+}
+
 .screenshot-viewer {
+  position: relative;
   display: flex;
   width: 100%;
   height: 100%;
@@ -427,6 +566,17 @@ body {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+  transform-origin: center;
+}
+
+.annotation-button {
+  margin: 8px;
+}
+
+.annotation-layer {
+  position: absolute;
+  cursor: crosshair;
+  pointer-events: auto;
   transform-origin: center;
 }
 
