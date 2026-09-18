@@ -36,6 +36,7 @@ const screenshotPanY = ref(0);
 const isDrawingMode = ref(false);
 const annotationPaths = ref<AnnotationPoint[][]>([]);
 const currentAnnotation = ref<AnnotationPoint[]>([]);
+const contextMenu = ref({ visible: false, x: 0, y: 0 });
 const isPanningScreenshot = ref(false);
 const screenshotPanStart = ref({ x: 0, y: 0 });
 const screenshotPanOrigin = ref({ x: 0, y: 0 });
@@ -268,6 +269,7 @@ function handleStorage(event: StorageEvent) {
 }
 
 onMounted(async () => {
+  window.addEventListener("pointerdown", closeContextMenu);
   window.addEventListener("storage", handleStorage);
   if (isCaptureWindow) {
     unlistenCaptureStart = await listen<ScreenCapture>("capture-start", (event) => {
@@ -282,6 +284,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("pointerdown", closeContextMenu);
   window.removeEventListener("keydown", onEscape);
   window.removeEventListener("storage", handleStorage);
   unlistenCaptureStart?.();
@@ -437,6 +440,64 @@ function annotationLayerStyle() {
     height: `${imageBounds.height}px`,
   };
 }
+
+async function copyAnnotatedScreenshot() {
+  if (!screenshot.value) {
+    return;
+  }
+
+  const image = new Image();
+  image.src = screenshot.value;
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("Unable to prepare screenshot for copying"));
+  });
+
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return;
+  }
+
+  context.drawImage(image, 0, 0);
+  context.strokeStyle = "#e53935";
+  context.lineWidth = Math.max(2, image.naturalWidth / 400);
+  context.lineCap = "round";
+  context.lineJoin = "round";
+
+  for (const path of [...annotationPaths.value, currentAnnotation.value]) {
+    if (!path.length) {
+      continue;
+    }
+
+    context.beginPath();
+    context.moveTo(path[0].x * canvas.width, path[0].y * canvas.height);
+    for (const point of path.slice(1)) {
+      context.lineTo(point.x * canvas.width, point.y * canvas.height);
+    }
+    context.stroke();
+  }
+
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (blob && navigator.clipboard && typeof ClipboardItem !== "undefined") {
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+  }
+  contextMenu.value.visible = false;
+}
+
+function openContextMenu(event: MouseEvent) {
+  contextMenu.value = {
+    visible: true,
+    x: event.clientX,
+    y: event.clientY,
+  };
+}
+
+function closeContextMenu() {
+  contextMenu.value.visible = false;
+}
 </script>
 
 <template>
@@ -475,6 +536,7 @@ function annotationLayerStyle() {
         @pointermove="moveScreenshotPan"
         @pointerup="endScreenshotPan"
         @pointercancel="endScreenshotPan"
+        @contextmenu.prevent="openContextMenu"
       >
         <img
           ref="screenshotImage"
@@ -509,6 +571,17 @@ function annotationLayerStyle() {
         </svg>
       </div>
     </v-main>
+
+    <div
+      v-if="contextMenu.visible"
+      class="context-menu"
+      :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
+      @pointerdown.stop
+    >
+      <v-btn variant="text" prepend-icon="mdi-content-copy" @click="copyAnnotatedScreenshot">
+        Copy image
+      </v-btn>
+    </div>
 
     <div
       v-if="isSelecting"
@@ -547,6 +620,16 @@ body {
 .side-panel {
   top: 64px !important;
   height: calc(100% - 64px) !important;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 3000;
+  padding: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 4px;
+  background: white;
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
 }
 
 .screenshot-viewer {
