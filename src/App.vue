@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -46,6 +46,17 @@ type AnnotationRectangle = {
 
 type AnnotationItem = AnnotationStroke | AnnotationRectangle;
 
+type AnnotationText = {
+  kind: "text";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  text: string;
+  color: string;
+  order: number;
+};
+
 const currentWindow = getCurrentWindow();
 const isCaptureWindow = currentWindow.label === "capture";
 const selectionImage = ref("");
@@ -61,6 +72,12 @@ const fillShapes = ref(false);
 const shapeMenuOpen = ref(false);
 const isShapeMode = ref(false);
 const selectedShape = ref<AnnotationRectangle["kind"]>("rectangle");
+const isTextMode = ref(false);
+const isEraserMode = ref(false);
+const isErasing = ref(false);
+const annotationTexts = ref<AnnotationText[]>([]);
+const currentTextBox = ref<AnnotationText | null>(null);
+const movingText = ref<{ id: number; startX: number; startY: number; originX: number; originY: number } | null>(null);
 const annotationRectangles = ref<AnnotationRectangle[]>([]);
 const currentRectangle = ref<AnnotationRectangle | null>(null);
 const annotationPaths = ref<AnnotationStroke[]>([]);
@@ -80,9 +97,10 @@ const startPoint = ref({ x: 0, y: 0 });
 let unlistenCaptureStart: UnlistenFn | undefined;
 let unlistenCaptureComplete: UnlistenFn | undefined;
 
-const orderedAnnotations = computed<AnnotationItem[]>(() => [
+const orderedAnnotations = computed<(AnnotationItem | AnnotationText)[]>(() => [
   ...annotationPaths.value,
   ...annotationRectangles.value,
+  ...annotationTexts.value,
 ].sort((first, second) => first.order - second.order));
 
 const selectionStyle = computed(() => {
@@ -109,6 +127,8 @@ function showScreenshot(image: string) {
   screenshotPanY.value = 0;
   annotationPaths.value = [];
   annotationRectangles.value = [];
+  annotationTexts.value = [];
+  currentTextBox.value = null;
   annotationOrder.value = 0;
   currentAnnotation.value = [];
   currentRectangle.value = null;
@@ -133,6 +153,44 @@ async function cancelSelection() {
 function onEscape(event: KeyboardEvent) {
   if (event.key === "Escape" && isSelecting.value) {
     void cancelSelection();
+  }
+}
+
+function undoLastAnnotation() {
+  if (currentAnnotation.value.length || currentRectangle.value || currentTextBox.value) {
+    currentAnnotation.value = [];
+    currentRectangle.value = null;
+    currentTextBox.value = null;
+    return;
+  }
+
+  const lastStroke = annotationPaths.value[annotationPaths.value.length - 1];
+  const lastShape = annotationRectangles.value[annotationRectangles.value.length - 1];
+  const lastText = annotationTexts.value[annotationTexts.value.length - 1];
+  const lastOrder = Math.max(
+    lastStroke?.order ?? -1,
+    lastShape?.order ?? -1,
+    lastText?.order ?? -1,
+  );
+
+  if (lastOrder < 0) {
+    return;
+  }
+
+  annotationPaths.value = annotationPaths.value.filter(({ order }) => order !== lastOrder);
+  annotationRectangles.value = annotationRectangles.value.filter(({ order }) => order !== lastOrder);
+  annotationTexts.value = annotationTexts.value.filter(({ order }) => order !== lastOrder);
+}
+
+function onKeyboardShortcut(event: KeyboardEvent) {
+  if (
+    event.ctrlKey &&
+    event.key.toLowerCase() === "z" &&
+    !(event.target instanceof HTMLTextAreaElement) &&
+    !(event.target instanceof HTMLInputElement)
+  ) {
+    event.preventDefault();
+    undoLastAnnotation();
   }
 }
 
@@ -309,6 +367,7 @@ function handleStorage(event: StorageEvent) {
 }
 
 onMounted(async () => {
+  window.addEventListener("keydown", onKeyboardShortcut);
   window.addEventListener("pointerdown", closeContextMenu);
   window.addEventListener("storage", handleStorage);
   if (isCaptureWindow) {
@@ -324,6 +383,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", onKeyboardShortcut);
   window.removeEventListener("pointerdown", closeContextMenu);
   window.removeEventListener("keydown", onEscape);
   window.removeEventListener("storage", handleStorage);
@@ -684,6 +744,8 @@ function toggleBrush() {
   } else {
     isShapeMode.value = false;
     shapeMenuOpen.value = false;
+    isTextMode.value = false;
+    isEraserMode.value = false;
     isDrawingMode.value = true;
   }
 }
@@ -691,6 +753,8 @@ function toggleBrush() {
 function selectShape(kind: AnnotationRectangle["kind"]) {
   isShapeMode.value = true;
   isDrawingMode.value = false;
+  isTextMode.value = false;
+  isEraserMode.value = false;
   brushMenuOpen.value = false;
   currentRectangle.value = currentRectangle.value
     ? { ...currentRectangle.value, kind }
@@ -698,9 +762,217 @@ function selectShape(kind: AnnotationRectangle["kind"]) {
   selectedShape.value = kind;
 }
 
+function toggleText() {
+  isTextMode.value = !isTextMode.value;
+  isDrawingMode.value = false;
+  isShapeMode.value = false;
+  isEraserMode.value = false;
+  brushMenuOpen.value = false;
+  shapeMenuOpen.value = false;
+}
+
+function distanceToSegment(point: AnnotationPoint, start: AnnotationPoint, end: AnnotationPoint) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const lengthSquared = dx * dx + dy * dy;
+  if (!lengthSquared) {
+    return Math.hypot(point.x - start.x, point.y - start.y);
+  }
+  const projection = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared));
+  return Math.hypot(point.x - (start.x + projection * dx), point.y - (start.y + projection * dy));
+}
+
+function eraseAnnotation(event: PointerEvent) {
+  const point = annotationPoint(event);
+  if (!point) {
+    return;
+  }
+
+  const hit = [...orderedAnnotations.value]
+    .reverse()
+    .find((annotation) => {
+      if (annotation.kind === "stroke") {
+        return annotation.points.some((strokePoint, index) =>
+          index === 0
+            ? distanceToSegment(point, strokePoint, strokePoint) < 0.03
+            : distanceToSegment(point, annotation.points[index - 1], strokePoint) < 0.03,
+        );
+      }
+
+      if (annotation.kind === "text") {
+        return point.x >= annotation.x && point.x <= annotation.x + annotation.width &&
+          point.y >= annotation.y && point.y <= annotation.y + annotation.height;
+      }
+
+      const minX = Math.min(annotation.start.x, annotation.end.x);
+      const maxX = Math.max(annotation.start.x, annotation.end.x);
+      const minY = Math.min(annotation.start.y, annotation.end.y);
+      const maxY = Math.max(annotation.start.y, annotation.end.y);
+      return point.x >= minX - 0.03 && point.x <= maxX + 0.03 &&
+        point.y >= minY - 0.03 && point.y <= maxY + 0.03;
+    });
+
+  if (hit) {
+    annotationPaths.value = annotationPaths.value.filter(({ order }) => order !== hit.order);
+    annotationRectangles.value = annotationRectangles.value.filter(({ order }) => order !== hit.order);
+    annotationTexts.value = annotationTexts.value.filter(({ order }) => order !== hit.order);
+  }
+}
+
+function startErasing(event: PointerEvent) {
+  if (event.button !== 0 || !event.isPrimary) {
+    return;
+  }
+
+  isErasing.value = true;
+  (event.currentTarget as SVGElement).setPointerCapture(event.pointerId);
+  eraseAnnotation(event);
+}
+
+function moveErasing(event: PointerEvent) {
+  if (isErasing.value) {
+    eraseAnnotation(event);
+  }
+}
+
+function endErasing(event: PointerEvent) {
+  if (!isErasing.value) {
+    return;
+  }
+
+  isErasing.value = false;
+  (event.currentTarget as SVGElement).releasePointerCapture(event.pointerId);
+}
+
+function toggleEraser() {
+  isEraserMode.value = !isEraserMode.value;
+  isDrawingMode.value = false;
+  isShapeMode.value = false;
+  isTextMode.value = false;
+  brushMenuOpen.value = false;
+  shapeMenuOpen.value = false;
+}
+
+function startText(event: PointerEvent) {
+  const point = annotationPoint(event);
+  if (!isTextMode.value || !point || event.button !== 0 || !event.isPrimary) {
+    return;
+  }
+
+  currentTextBox.value = {
+    kind: "text",
+    x: point.x,
+    y: point.y,
+    width: 0,
+    height: 0,
+    text: "",
+    color: brushColor.value,
+    order: annotationOrder.value++,
+  };
+  (event.currentTarget as SVGElement).setPointerCapture(event.pointerId);
+}
+
+function moveText(event: PointerEvent) {
+  if (!currentTextBox.value) {
+    return;
+  }
+  const point = annotationPoint(event);
+  if (point) {
+    currentTextBox.value = {
+      ...currentTextBox.value,
+      width: point.x - currentTextBox.value.x,
+      height: point.y - currentTextBox.value.y,
+    };
+  }
+}
+
+function endText(event: PointerEvent) {
+  if (!currentTextBox.value) {
+    return;
+  }
+  const box = currentTextBox.value;
+  const normalized = {
+    ...box,
+    x: Math.min(box.x, box.x + box.width),
+    y: Math.min(box.y, box.y + box.height),
+    width: Math.abs(box.width),
+    height: Math.abs(box.height),
+  };
+  currentTextBox.value = null;
+  if (normalized.width > 0.02 && normalized.height > 0.02) {
+    annotationTexts.value = [...annotationTexts.value, normalized];
+    nextTick(() => document.querySelector<HTMLTextAreaElement>(`.text-box[data-order="${normalized.order}"]`)?.focus());
+  }
+  (event.currentTarget as SVGElement).releasePointerCapture(event.pointerId);
+}
+
+function startTextMove(event: PointerEvent, text: AnnotationText) {
+  if (event.button !== 0) {
+    return;
+  }
+  movingText.value = {
+    id: text.order,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: text.x,
+    originY: text.y,
+  };
+  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+}
+
+function moveTextBox(event: PointerEvent) {
+  if (!movingText.value || !screenshotImage.value) {
+    return;
+  }
+  const bounds = screenshotImage.value.getBoundingClientRect();
+  const text = annotationTexts.value.find(({ order }) => order === movingText.value?.id);
+  if (text) {
+    text.x = movingText.value.originX + (event.clientX - movingText.value.startX) / bounds.width;
+    text.y = movingText.value.originY + (event.clientY - movingText.value.startY) / bounds.height;
+  }
+}
+
+function endTextMove() {
+  movingText.value = null;
+}
+
+function handleAnnotationDown(event: PointerEvent) {
+  if (isEraserMode.value) {
+    startErasing(event);
+  } else if (isTextMode.value) {
+    startText(event);
+  } else {
+    startAnnotation(event);
+  }
+}
+
+function handleAnnotationMove(event: PointerEvent) {
+  if (isEraserMode.value) {
+    moveErasing(event);
+    return;
+  } else if (isTextMode.value) {
+    moveText(event);
+  } else {
+    moveAnnotation(event);
+  }
+}
+
+function handleAnnotationEnd(event: PointerEvent) {
+  if (isEraserMode.value) {
+    endErasing(event);
+    return;
+  } else if (isTextMode.value) {
+    endText(event);
+  } else {
+    void endAnnotation(event);
+  }
+}
+
 function toggleShapesMenu() {
   isShapeMode.value = true;
   isDrawingMode.value = false;
+  isTextMode.value = false;
+  isEraserMode.value = false;
   brushMenuOpen.value = false;
   shapeMenuOpen.value = !shapeMenuOpen.value;
 }
@@ -827,6 +1099,26 @@ function toggleShapesMenu() {
           />
         </v-card>
       </v-menu>
+      <v-btn
+        class="annotation-button"
+        :color="isTextMode ? 'primary' : undefined"
+        icon="mdi-format-text"
+        variant="text"
+        aria-label="Text"
+        title="Text"
+        :disabled="!screenshot"
+        @click="toggleText"
+      />
+      <v-btn
+        class="annotation-button"
+        :color="isEraserMode ? 'primary' : undefined"
+        icon="mdi-eraser"
+        variant="text"
+        aria-label="Eraser"
+        title="Eraser"
+        :disabled="!screenshot"
+        @click="toggleEraser"
+      />
     </v-navigation-drawer>
 
     <v-app-bar flat height="64" class="top-bar">
@@ -846,7 +1138,7 @@ function toggleShapesMenu() {
         v-if="screenshot"
         ref="screenshotViewer"
         class="screenshot-viewer"
-        @pointerdown="startScreenshotPan"
+        @pointerdown="isTextMode ? startText : startScreenshotPan"
         @pointermove="moveScreenshotPan"
         @pointerup="endScreenshotPan"
         @pointercancel="endScreenshotPan"
@@ -862,15 +1154,15 @@ function toggleShapesMenu() {
           alt="Selected screenshot"
         />
         <svg
-          v-if="isDrawingMode || isShapeMode"
+          v-if="isDrawingMode || isShapeMode || isTextMode || isEraserMode"
           class="annotation-layer"
           :style="annotationLayerStyle()"
           viewBox="0 0 100 100"
           preserveAspectRatio="none"
-          @pointerdown.stop="startAnnotation"
-          @pointermove.stop="moveAnnotation"
-          @pointerup.stop="endAnnotation"
-          @pointercancel.stop="endAnnotation"
+          @pointerdown.stop="handleAnnotationDown"
+          @pointermove.stop="handleAnnotationMove"
+          @pointerup.stop="handleAnnotationEnd"
+          @pointercancel.stop="handleAnnotationEnd"
         >
           <defs>
             <marker
@@ -924,7 +1216,7 @@ function toggleShapesMenu() {
               vector-effect="non-scaling-stroke"
             />
             <line
-              v-else
+              v-else-if="annotation.kind === 'line' || annotation.kind === 'arrow'"
               :x1="annotation.start.x * 100"
               :y1="annotation.start.y * 100"
               :x2="annotation.end.x * 100"
@@ -988,6 +1280,50 @@ function toggleShapesMenu() {
             />
           </g>
         </svg>
+        <div class="text-annotation-layer" :style="annotationLayerStyle()">
+          <div
+            v-if="currentTextBox"
+            class="text-box text-box-preview"
+            :style="{
+              left: `${Math.min(currentTextBox.x, currentTextBox.x + currentTextBox.width) * 100}%`,
+              top: `${Math.min(currentTextBox.y, currentTextBox.y + currentTextBox.height) * 100}%`,
+              width: `${Math.abs(currentTextBox.width) * 100}%`,
+              height: `${Math.abs(currentTextBox.height) * 100}%`,
+            }"
+          />
+          <div
+            v-for="text in annotationTexts"
+            :key="text.order"
+            class="text-box"
+            :data-order="text.order"
+            @pointerdown.stop
+            :style="{
+              left: `${text.x * 100}%`,
+              top: `${text.y * 100}%`,
+              width: `${text.width * 100}%`,
+              height: `${text.height * 100}%`,
+              color: text.color,
+            }"
+          >
+            <button
+              class="text-move-handle"
+              type="button"
+              aria-label="Move text"
+              @pointerdown.stop="startTextMove($event, text)"
+              @pointermove.stop="moveTextBox"
+              @pointerup.stop="endTextMove"
+              @pointercancel.stop="endTextMove"
+            >
+              <v-icon size="12">mdi-drag</v-icon>
+            </button>
+            <textarea
+              v-model="text.text"
+              class="text-input"
+              :style="{ color: text.color }"
+              @pointerdown.stop
+            />
+          </div>
+        </div>
       </div>
     </v-main>
 
@@ -1104,6 +1440,49 @@ body {
   cursor: crosshair;
   pointer-events: auto;
   transform-origin: center;
+}
+
+.text-annotation-layer {
+  position: absolute;
+  pointer-events: none;
+}
+
+.text-box {
+  position: absolute;
+  min-width: 48px;
+  min-height: 28px;
+  border: 1px dashed rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+
+.text-input {
+  width: 100%;
+  height: 100%;
+  min-width: 100%;
+  min-height: 100%;
+  padding: 8px;
+  border: 0;
+  outline: 0;
+  resize: both;
+  background: transparent;
+  font: inherit;
+  line-height: 1.2;
+}
+
+.text-move-handle {
+  position: absolute;
+  z-index: 1;
+  top: -18px;
+  left: -1px;
+  display: flex;
+  width: 20px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: white;
+  cursor: move;
 }
 
 .selection-surface {
