@@ -26,6 +26,12 @@ type AnnotationPoint = {
   y: number;
 };
 
+type AnnotationStroke = {
+  points: AnnotationPoint[];
+  color: string;
+  width: number;
+};
+
 const currentWindow = getCurrentWindow();
 const isCaptureWindow = currentWindow.label === "capture";
 const selectionImage = ref("");
@@ -34,7 +40,10 @@ const screenshotZoom = ref(1);
 const screenshotPanX = ref(0);
 const screenshotPanY = ref(0);
 const isDrawingMode = ref(false);
-const annotationPaths = ref<AnnotationPoint[][]>([]);
+const brushMenuOpen = ref(false);
+const brushColor = ref("#e53935");
+const brushWidth = ref(4);
+const annotationPaths = ref<AnnotationStroke[]>([]);
 const currentAnnotation = ref<AnnotationPoint[]>([]);
 const contextMenu = ref({ visible: false, x: 0, y: 0 });
 const isPanningScreenshot = ref(false);
@@ -415,7 +424,14 @@ function endAnnotation(event: PointerEvent) {
     return;
   }
 
-  annotationPaths.value = [...annotationPaths.value, currentAnnotation.value];
+  annotationPaths.value = [
+    ...annotationPaths.value,
+    {
+      points: currentAnnotation.value,
+      color: brushColor.value,
+      width: brushWidth.value,
+    },
+  ];
   currentAnnotation.value = [];
   (event.currentTarget as SVGElement).releasePointerCapture(event.pointerId);
 }
@@ -462,16 +478,25 @@ async function copyAnnotatedScreenshot() {
   }
 
   context.drawImage(image, 0, 0);
-  context.strokeStyle = "#e53935";
-  context.lineWidth = Math.max(2, image.naturalWidth / 400);
   context.lineCap = "round";
   context.lineJoin = "round";
 
-  for (const path of [...annotationPaths.value, currentAnnotation.value]) {
+  const strokes = [
+    ...annotationPaths.value,
+    {
+      points: currentAnnotation.value,
+      color: brushColor.value,
+      width: brushWidth.value,
+    },
+  ];
+  for (const stroke of strokes) {
+    const path = stroke.points;
     if (!path.length) {
       continue;
     }
 
+    context.strokeStyle = stroke.color;
+    context.lineWidth = Math.max(4, (image.naturalWidth / 300) * (stroke.width / 4));
     context.beginPath();
     context.moveTo(path[0].x * canvas.width, path[0].y * canvas.height);
     for (const point of path.slice(1)) {
@@ -498,21 +523,73 @@ function openContextMenu(event: MouseEvent) {
 function closeContextMenu() {
   contextMenu.value.visible = false;
 }
+
+function toggleBrush() {
+  if (isDrawingMode.value) {
+    brushMenuOpen.value = !brushMenuOpen.value;
+  } else {
+    isDrawingMode.value = true;
+  }
+}
 </script>
 
 <template>
   <v-app>
     <v-navigation-drawer permanent width="64" class="side-panel">
-      <v-btn
-        class="annotation-button"
-        :color="isDrawingMode ? 'primary' : undefined"
-        icon="mdi-pen"
-        variant="text"
-        aria-label="Annotate screenshot"
-        title="Annotate screenshot"
-        :disabled="!screenshot"
-        @click="isDrawingMode = !isDrawingMode"
-      />
+      <v-menu
+        v-model="brushMenuOpen"
+        location="end"
+        :close-on-content-click="false"
+        :open-on-click="false"
+      >
+        <template #activator="{ props }">
+          <v-btn
+            v-bind="props"
+            class="annotation-button"
+            :color="isDrawingMode ? 'primary' : undefined"
+            icon="mdi-brush"
+            variant="text"
+            aria-label="Brush"
+            title="Brush"
+            :disabled="!screenshot"
+            @click="toggleBrush"
+          />
+        </template>
+        <v-card class="brush-menu pa-3" width="220">
+          <v-text-field
+            v-model="brushColor"
+            label="Color"
+            type="color"
+            variant="outlined"
+            density="compact"
+            hide-details
+          />
+          <div class="brush-width-control">
+            <v-slider
+              v-model="brushWidth"
+              label="Width"
+              min="2"
+              max="16"
+              step="1"
+              thumb-label
+              hide-details
+            />
+            <span class="brush-preview-box" aria-label="Brush size preview">
+              <span
+                class="brush-preview-dot"
+                :style="{
+                  width: `${brushWidth}px`,
+                  height: `${brushWidth}px`,
+                  backgroundColor: brushColor,
+                }"
+              />
+            </span>
+          </div>
+          <v-btn block variant="text" size="small" @click="isDrawingMode = false; brushMenuOpen = false">
+            Done
+          </v-btn>
+        </v-card>
+      </v-menu>
     </v-navigation-drawer>
 
     <v-app-bar flat height="64" class="top-bar">
@@ -559,14 +636,25 @@ function closeContextMenu() {
           @pointercancel.stop="endAnnotation"
         >
           <polyline
-            v-for="(path, index) in [...annotationPaths, currentAnnotation]"
+            v-for="(stroke, index) in annotationPaths"
             :key="index"
-            :points="annotationPoints(path)"
+            :points="annotationPoints(stroke.points)"
             fill="none"
-            stroke="#e53935"
+            :stroke="stroke.color"
             stroke-linecap="round"
             stroke-linejoin="round"
-            stroke-width="0.7"
+            :stroke-width="stroke.width"
+            vector-effect="non-scaling-stroke"
+          />
+          <polyline
+            v-if="currentAnnotation.length"
+            :points="annotationPoints(currentAnnotation)"
+            fill="none"
+            :stroke="brushColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            :stroke-width="brushWidth"
+            vector-effect="non-scaling-stroke"
           />
         </svg>
       </div>
@@ -654,6 +742,30 @@ body {
 
 .annotation-button {
   margin: 8px;
+}
+
+.brush-width-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brush-width-control .v-slider {
+  flex: 1;
+}
+
+.brush-preview-box {
+  display: flex;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  align-items: center;
+  justify-content: center;
+}
+
+.brush-preview-dot {
+  display: block;
+  border-radius: 50%;
 }
 
 .annotation-layer {
